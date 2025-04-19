@@ -3,7 +3,7 @@ HanaokaYuzu / Gemini-API 的服务端简单实现
 
 ## 直接运行
 
-0. 填入 `Secure_1PSID` 和 `Secure_1PSIDTS`  （登录下 Gemini 去 Application - Cookie 里面找）
+0. 填入 `SECURE_1PSID` 和 `SECURE_1PSIDTS`（登录 Gemini 在浏览器开发工具中查找 Cookie）
 ```properties
 SECURE_1PSID = "COOKIE VALUE HERE"
 SECURE_1PSIDTS = "COOKIE VALUE HERE"
@@ -25,42 +25,54 @@ SECURE_1PSIDTS = "COOKIE VALUE HERE"
 
 ⚠️ tips: 没有任何API Key，直接使用
 
-## 使用Docker运行
+## 使用Docker运行（推荐）
 
-### 使用Docker Compose (推荐)
+### 快速开始
 
-1. 确保安装了Docker和Docker Compose
-2. 配置Gemini凭据（两种方式）:
+1. 克隆本项目
+```bash
+git clone https://github.com/zhiyu1998/Gemi2Api-Server.git
+```
 
-   a. 创建 `.env` 文件（从示例复制并填入你的凭据）:
+2. 创建 `.env` 文件并填入你的 Gemini Cookie 凭据:
    ```bash
    cp .env.example .env
-   # 然后编辑 .env 文件，填入你的真实凭据值
+   # 用编辑器打开 .env 文件，填入你的 Cookie 值
    ```
-   
-   b. 或直接在环境中设置变量:
+
+3. 启动服务:
    ```bash
-   export SECURE_1PSID="你的凭据值"
-   export SECURE_1PSIDTS="你的凭据值"
+   docker-compose up -d
    ```
 
-3. 在项目根目录运行:
+4. 服务将在 http://0.0.0.0:8000 上运行
+
+### 常见问题
+
+如果遇到 `Failed to initialize client` 错误，这通常是因为 Cookie 已过期。请按以下步骤更新:
+
+1. 访问 [Google Gemini](https://gemini.google.com/) 并登录
+2. 打开浏览器开发工具 (F12)
+3. 切换到 "Application" 或 "应用程序" 标签
+4. 在左侧找到 "Cookies" > "gemini.google.com"
+5. 复制 `__Secure-1PSID` 和 `__Secure-1PSIDTS` 的值
+6. 更新 `.env` 文件
+7. 重启容器: `docker-compose restart`
+
+### 其他 Docker 命令
+
 ```bash
-docker-compose up -d
-```
+# 查看日志
+docker-compose logs
 
-服务将在 http://localhost:8000 上运行
+# 重启服务
+docker-compose restart
 
-### 使用Dockerfile
+# 停止服务
+docker-compose down
 
-1. 构建Docker镜像:
-```bash
-docker build -t gemini-api .
-```
-
-2. 运行容器并传入环境变量:
-```bash
-docker run -p 8000:8000 -e SECURE_1PSID="你的凭据值" -e SECURE_1PSIDTS="你的凭据值" gemini-api
+# 重新构建并启动
+docker-compose up -d --build
 ```
 
 ## API端点
