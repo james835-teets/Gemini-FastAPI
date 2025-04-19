@@ -23,16 +23,17 @@ SECURE_1PSIDTS = "COOKIE VALUE HERE"
 3. 启动
 > uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
-⚠️ tips: 没有任何API Key，直接使用
+> [!WARNING] 
+> tips: 没有任何API Key，直接使用
 
 ## 使用Docker运行（推荐）
 
 ### 快速开始
 
 1. 克隆本项目
-```bash
-git clone https://github.com/zhiyu1998/Gemi2Api-Server.git
-```
+   ```bash
+   git clone https://github.com/zhiyu1998/Gemi2Api-Server.git
+   ```
 
 2. 创建 `.env` 文件并填入你的 Gemini Cookie 凭据:
    ```bash
