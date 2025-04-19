@@ -32,10 +32,10 @@ SECURE_1PSIDTS = "COOKIE VALUE HERE"
 1. 确保安装了Docker和Docker Compose
 2. 配置Gemini凭据（两种方式）:
 
-   a. 创建一个 `.env` 文件在项目根目录（已提供示例文件）:
-   ```
-   SECURE_1PSID=你的凭据值
-   SECURE_1PSIDTS=你的凭据值
+   a. 创建 `.env` 文件（从示例复制并填入你的凭据）:
+   ```bash
+   cp .env.example .env
+   # 然后编辑 .env 文件，填入你的真实凭据值
    ```
    
    b. 或直接在环境中设置变量:
