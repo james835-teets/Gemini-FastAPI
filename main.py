@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import datetime, timezone
+import os
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,8 +36,8 @@ app.add_middleware(
 gemini_client = None
 
 # Authentication credentials
-SECURE_1PSID = ""
-SECURE_1PSIDTS = ""
+SECURE_1PSID = os.environ.get("SECURE_1PSID", "")
+SECURE_1PSIDTS = os.environ.get("SECURE_1PSIDTS", "")
 
 
 # Pydantic models for API requests and responses

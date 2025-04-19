@@ -7,4 +7,7 @@ services:
       - "8000:8000"
     volumes:
       - ./main.py:/app/main.py
+    environment:
+      - SECURE_1PSID=${SECURE_1PSID}
+      - SECURE_1PSIDTS=${SECURE_1PSIDTS}
     restart: unless-stopped

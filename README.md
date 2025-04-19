@@ -5,8 +5,8 @@ HanaokaYuzu / Gemini-API 的服务端简单实现
 
 0. 填入 `Secure_1PSID` 和 `Secure_1PSIDTS`  （登录下 Gemini 去 Application - Cookie 里面找）
 ```properties
-Secure_1PSID = "COOKIE VALUE HERE"
-Secure_1PSIDTS = "COOKIE VALUE HERE"
+SECURE_1PSID = "COOKIE VALUE HERE"
+SECURE_1PSIDTS = "COOKIE VALUE HERE"
 ```
 1. `uv` 安装一下依赖
 > uv init
@@ -30,8 +30,21 @@ Secure_1PSIDTS = "COOKIE VALUE HERE"
 ### 使用Docker Compose (推荐)
 
 1. 确保安装了Docker和Docker Compose
-2. 在项目根目录运行:
+2. 配置Gemini凭据（两种方式）:
 
+   a. 创建一个 `.env` 文件在项目根目录（已提供示例文件）:
+   ```
+   SECURE_1PSID=你的凭据值
+   SECURE_1PSIDTS=你的凭据值
+   ```
+   
+   b. 或直接在环境中设置变量:
+   ```bash
+   export SECURE_1PSID="你的凭据值"
+   export SECURE_1PSIDTS="你的凭据值"
+   ```
+
+3. 在项目根目录运行:
 ```bash
 docker-compose up -d
 ```
@@ -41,15 +54,13 @@ docker-compose up -d
 ### 使用Dockerfile
 
 1. 构建Docker镜像:
-
 ```bash
 docker build -t gemini-api .
 ```
 
-2. 运行容器:
-
+2. 运行容器并传入环境变量:
 ```bash
-docker run -p 8000:8000 gemini-api
+docker run -p 8000:8000 -e SECURE_1PSID="你的凭据值" -e SECURE_1PSIDTS="你的凭据值" gemini-api
 ```
 
 ## API端点
