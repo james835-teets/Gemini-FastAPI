@@ -13,6 +13,10 @@ SECURE_1PSIDTS = "COOKIE VALUE HERE"
 > 
 > uv add fastapi uvicorn gemini-webapi
 
+> [!NOTE]  
+> 如果存在`pyproject.toml` 那么就使用下面的命令：  
+> uv sync
+
 或者 `pip` 也可以
 
 > pip install fastapi uvicorn gemini-webapi
