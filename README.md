@@ -54,18 +54,6 @@ SECURE_1PSIDTS = "COOKIE VALUE HERE"
 
 4. 服务将在 http://0.0.0.0:8000 上运行
 
-### 常见问题
-
-如果遇到 `Failed to initialize client` 错误，这通常是因为 Cookie 已过期。请按以下步骤更新:
-
-1. 访问 [Google Gemini](https://gemini.google.com/) 并登录
-2. 打开浏览器开发工具 (F12)
-3. 切换到 "Application" 或 "应用程序" 标签
-4. 在左侧找到 "Cookies" > "gemini.google.com"
-5. 复制 `__Secure-1PSID` 和 `__Secure-1PSIDTS` 的值
-6. 更新 `.env` 文件
-7. 重启容器: `docker-compose restart`
-
 ### 其他 Docker 命令
 
 ```bash
@@ -82,41 +70,25 @@ docker-compose down
 docker-compose up -d --build
 ```
 
-## 环境变量配置
-
-服务需要以下环境变量来与Gemini API进行通信：
-
-- `SECURE_1PSID` - Google账号的身份验证Cookie
-- `SECURE_1PSIDTS` - Google账号的身份验证Cookie
-
-### Docker 环境变量配置
-
-使用`.env`文件设置环境变量（推荐方式）：
-
-1. 创建`.env`文件，参考`.env.example`：
-```bash
-# 复制示例文件
-cp .env.example .env
-
-# 编辑.env文件
-nano .env  # 或使用其他编辑器
-```
-
-2. 在`.env`文件中设置变量（**注意：不要使用引号**）：
-```
-SECURE_1PSID=你的SECURE_1PSID值
-SECURE_1PSIDTS=你的SECURE_1PSIDTS值
-```
-
-3. 确保值格式正确：
-   - 不要在值两边加引号
-   - 确保没有多余的空格
-   - 复制时确保没有包含不可见字符
-
-如果环境变量仍然没有被正确加载，可以尝试直接在`docker-compose.yml`中的`environment`部分设置。
-
 ## API端点
 
 - `GET /`: 服务状态检查
 - `GET /v1/models`: 获取可用模型列表
 - `POST /v1/chat/completions`: 与模型聊天 (类似OpenAI接口)
+
+## 常见问题
+
+### 服务器报 500 问题解决方案
+
+500 的问题一般是 IP 不太行 或者 请求太频繁（后者等待一段时间或者重新新建一个隐身标签登录一下重新给 Secure_1PSID 和 Secure_1PSIDTS 即可），见 issue：
+- [__Secure-1PSIDTS · Issue #6 · HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API/issues/6)
+- [Failed to initialize client. SECURE_1PSIDTS could get expired frequently · Issue #72 · HanaokaYuzu/Gemini-API](https://github.com/HanaokaYuzu/Gemini-API/issues/72)
+
+解决步骤：
+1. 使用隐身标签访问 [Google Gemini](https://gemini.google.com/) 并登录
+2. 打开浏览器开发工具 (F12)
+3. 切换到 "Application" 或 "应用程序" 标签
+4. 在左侧找到 "Cookies" > "gemini.google.com"
+5. 复制 `__Secure-1PSID` 和 `__Secure-1PSIDTS` 的值
+6. 更新 `.env` 文件
+7. 重新构建并启动: `docker-compose up -d --build`
