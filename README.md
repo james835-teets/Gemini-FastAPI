@@ -1,6 +1,8 @@
 # Gemi2Api-Server
 [HanaokaYuzu / Gemini-API](https://github.com/HanaokaYuzu/Gemini-API) 的服务端简单实现
 
+![pETwdjf.png](https://s21.ax1x.com/2025/04/27/pETwdjf.png)
+
 ## 直接运行
 
 0. 填入 `SECURE_1PSID` 和 `SECURE_1PSIDTS`（登录 Gemini 在浏览器开发工具中查找 Cookie）
