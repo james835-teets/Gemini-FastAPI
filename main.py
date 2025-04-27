@@ -2,13 +2,15 @@ import asyncio
 import json
 from datetime import datetime, timezone
 import os
+import base64
+import tempfile
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Union
 import time
 import uuid
 import logging
@@ -42,15 +44,25 @@ SECURE_1PSIDTS = os.environ.get("SECURE_1PSIDTS", "")
 # Print debug info at startup
 if not SECURE_1PSID or not SECURE_1PSIDTS:
     logger.warning("⚠️ Gemini API credentials are not set or empty! Please check your environment variables.")
+    logger.warning("Make sure SECURE_1PSID and SECURE_1PSIDTS are correctly set in your .env file or environment.")
+    logger.warning("If using Docker, ensure the .env file is correctly mounted and formatted.")
+    logger.warning("Example format in .env file (no quotes):")
+    logger.warning("SECURE_1PSID=your_secure_1psid_value_here")
+    logger.warning("SECURE_1PSIDTS=your_secure_1psidts_value_here")
 else:
     # Only log the first few characters for security
     logger.info(f"Credentials found. SECURE_1PSID starts with: {SECURE_1PSID[:5]}...")
     logger.info(f"Credentials found. SECURE_1PSIDTS starts with: {SECURE_1PSIDTS[:5]}...")
 
 # Pydantic models for API requests and responses
+class ContentItem(BaseModel):
+    type: str
+    text: Optional[str] = None
+    image_url: Optional[Dict[str, str]] = None
+
 class Message(BaseModel):
     role: str
-    content: str
+    content: Union[str, List[ContentItem]]
     name: Optional[str] = None
 
 
@@ -166,21 +178,54 @@ def map_model_name(openai_model_name: str) -> Model:
 
 
 # Prepare conversation history from OpenAI messages format
-def prepare_conversation(messages: List[Message]) -> str:
+def prepare_conversation(messages: List[Message]) -> tuple:
     conversation = ""
+    temp_files = []
 
     for msg in messages:
-        if msg.role == "system":
-            conversation += f"System: {msg.content}\n\n"
-        elif msg.role == "user":
-            conversation += f"Human: {msg.content}\n\n"
-        elif msg.role == "assistant":
-            conversation += f"Assistant: {msg.content}\n\n"
+        if isinstance(msg.content, str):
+            # String content handling
+            if msg.role == "system":
+                conversation += f"System: {msg.content}\n\n"
+            elif msg.role == "user":
+                conversation += f"Human: {msg.content}\n\n"
+            elif msg.role == "assistant":
+                conversation += f"Assistant: {msg.content}\n\n"
+        else:
+            # Mixed content handling
+            if msg.role == "user":
+                conversation += "Human: "
+            elif msg.role == "system":
+                conversation += "System: "
+            elif msg.role == "assistant":
+                conversation += "Assistant: "
+            
+            for item in msg.content:
+                if item.type == "text":
+                    conversation += item.text or ""
+                elif item.type == "image_url" and item.image_url:
+                    # Handle image
+                    image_url = item.image_url.get("url", "")
+                    if image_url.startswith("data:image/"):
+                        # Process base64 encoded image
+                        try:
+                            # Extract the base64 part
+                            base64_data = image_url.split(",")[1]
+                            image_data = base64.b64decode(base64_data)
+                            
+                            # Create temporary file to hold the image
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                                tmp.write(image_data)
+                                temp_files.append(tmp.name)
+                        except Exception as e:
+                            logger.error(f"Error processing base64 image: {str(e)}")
+            
+            conversation += "\n\n"
 
     # Add a final prompt for the assistant to respond to
     conversation += "Assistant: "
 
-    return conversation
+    return conversation, temp_files
 
 
 # Dependency to get the initialized Gemini client
@@ -210,8 +255,9 @@ async def create_chat_completion(request: ChatCompletionRequest):
             logger.info("Gemini client initialized successfully")
 
         # 转换消息为对话格式
-        conversation = prepare_conversation(request.messages)
+        conversation, temp_files = prepare_conversation(request.messages)
         logger.info(f"Prepared conversation: {conversation}")
+        logger.info(f"Temp files: {temp_files}")
 
         # 获取适当的模型
         model = map_model_name(request.model)
@@ -219,7 +265,23 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
         # 生成响应
         logger.info("Sending request to Gemini...")
-        response = await gemini_client.generate_content(conversation, model=model)
+        if temp_files:
+            # With files
+            response = await gemini_client.generate_content(
+                conversation, 
+                files=temp_files,
+                model=model
+            )
+        else:
+            # Text only
+            response = await gemini_client.generate_content(conversation, model=model)
+
+        # 清理临时文件
+        for temp_file in temp_files:
+            try:
+                os.unlink(temp_file)
+            except Exception as e:
+                logger.warning(f"Failed to delete temp file {temp_file}: {str(e)}")
 
         # 提取文本响应
         reply_text = ""

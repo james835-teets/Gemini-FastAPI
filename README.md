@@ -1,5 +1,5 @@
 # Gemi2Api-Server
-HanaokaYuzu / Gemini-API 的服务端简单实现
+[HanaokaYuzu / Gemini-API](https://github.com/HanaokaYuzu/Gemini-API) 的服务端简单实现
 
 ## 直接运行
 
@@ -79,6 +79,39 @@ docker-compose down
 # 重新构建并启动
 docker-compose up -d --build
 ```
+
+## 环境变量配置
+
+服务需要以下环境变量来与Gemini API进行通信：
+
+- `SECURE_1PSID` - Google账号的身份验证Cookie
+- `SECURE_1PSIDTS` - Google账号的身份验证Cookie
+
+### Docker 环境变量配置
+
+使用`.env`文件设置环境变量（推荐方式）：
+
+1. 创建`.env`文件，参考`.env.example`：
+```bash
+# 复制示例文件
+cp .env.example .env
+
+# 编辑.env文件
+nano .env  # 或使用其他编辑器
+```
+
+2. 在`.env`文件中设置变量（**注意：不要使用引号**）：
+```
+SECURE_1PSID=你的SECURE_1PSID值
+SECURE_1PSIDTS=你的SECURE_1PSIDTS值
+```
+
+3. 确保值格式正确：
+   - 不要在值两边加引号
+   - 确保没有多余的空格
+   - 复制时确保没有包含不可见字符
+
+如果环境变量仍然没有被正确加载，可以尝试直接在`docker-compose.yml`中的`environment`部分设置。
 
 ## API端点
 
