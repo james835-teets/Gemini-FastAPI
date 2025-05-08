@@ -5,7 +5,7 @@ import os
 import base64
 import tempfile
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import StreamingResponse
@@ -40,6 +40,7 @@ gemini_client = None
 # Authentication credentials
 SECURE_1PSID = os.environ.get("SECURE_1PSID", "")
 SECURE_1PSIDTS = os.environ.get("SECURE_1PSIDTS", "")
+API_KEY = os.environ.get("API_KEY", "")
 
 # Print debug info at startup
 if not SECURE_1PSID or not SECURE_1PSIDTS:
@@ -53,6 +54,12 @@ else:
 	# Only log the first few characters for security
 	logger.info(f"Credentials found. SECURE_1PSID starts with: {SECURE_1PSID[:5]}...")
 	logger.info(f"Credentials found. SECURE_1PSIDTS starts with: {SECURE_1PSIDTS[:5]}...")
+
+if not API_KEY:
+	logger.warning("⚠️ API_KEY is not set or empty! API authentication will not work.")
+	logger.warning("Make sure API_KEY is correctly set in your .env file or environment.")
+else:
+	logger.info(f"API_KEY found. API_KEY starts with: {API_KEY[:5]}...")
 
 
 # Pydantic models for API requests and responses
@@ -112,6 +119,29 @@ class ModelData(BaseModel):
 class ModelList(BaseModel):
 	object: str = "list"
 	data: List[ModelData]
+
+
+# Authentication dependency
+async def verify_api_key(authorization: str = Header(None)):
+	if not API_KEY:
+		# If API_KEY is not set in environment, skip validation (for development)
+		logger.warning("API key validation skipped - no API_KEY set in environment")
+		return
+
+	if not authorization:
+		raise HTTPException(status_code=401, detail="Missing Authorization header")
+	
+	try:
+		scheme, token = authorization.split()
+		if scheme.lower() != "bearer":
+			raise HTTPException(status_code=401, detail="Invalid authentication scheme. Use Bearer token")
+		
+		if token != API_KEY:
+			raise HTTPException(status_code=401, detail="Invalid API key")
+	except ValueError:
+		raise HTTPException(status_code=401, detail="Invalid authorization format. Use 'Bearer YOUR_API_KEY'")
+	
+	return token
 
 
 # Simple error handler middleware
@@ -241,7 +271,7 @@ async def get_gemini_client():
 
 
 @app.post("/v1/chat/completions")
-async def create_chat_completion(request: ChatCompletionRequest):
+async def create_chat_completion(request: ChatCompletionRequest, api_key: str = Depends(verify_api_key)):
 	try:
 		# 确保客户端已初始化
 		global gemini_client
