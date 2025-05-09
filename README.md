@@ -11,10 +11,11 @@
 
 ## 直接运行
 
-0. 填入 `SECURE_1PSID` 和 `SECURE_1PSIDTS`（登录 Gemini 在浏览器开发工具中查找 Cookie）
+0. 填入 `SECURE_1PSID` 和 `SECURE_1PSIDTS`（登录 Gemini 在浏览器开发工具中查找 Cookie），有必要的话可以填写 `API_KEY`
 ```properties
 SECURE_1PSID = "COOKIE VALUE HERE"
 SECURE_1PSIDTS = "COOKIE VALUE HERE"
+API_KEY= "API_KEY VALUE HERE"
 ```
 1. `uv` 安装一下依赖
 > uv init
