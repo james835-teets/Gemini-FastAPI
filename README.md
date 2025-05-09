@@ -37,7 +37,7 @@ API_KEY= "API_KEY VALUE HERE"
 > uvicorn main:app --reload --host 127.0.0.1 --port 8000
 
 > [!WARNING] 
-> tips: 没有任何API Key，直接使用
+> tips: 如果不填写 API_KEY ，那么就直接使用
 
 ## 使用Docker运行（推荐）
 
