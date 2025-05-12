@@ -12,5 +12,7 @@ services:
         sync: false
       - key: SECURE_1PSIDTS
         sync: false
+      - key: API_KEY
+        sync: false
     healthCheckPath: /
     autoDeploy: true
