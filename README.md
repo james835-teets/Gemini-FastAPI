@@ -106,7 +106,7 @@ docker-compose up -d --build
 
 ## 贡献
 
-同时感谢以下开发者对 `Nonebot - R插件` 作出的贡献：
+同时感谢以下开发者对 `Gemi2Api-Server` 作出的贡献：
 
 <a href="https://github.com/zhiyu1998/Gemi2Api-Server/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=zhiyu1998/Gemi2Api-Server&max=1000" />
