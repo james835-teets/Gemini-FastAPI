@@ -103,3 +103,11 @@ docker-compose up -d --build
 5. 复制 `__Secure-1PSID` 和 `__Secure-1PSIDTS` 的值
 6. 更新 `.env` 文件
 7. 重新构建并启动: `docker-compose up -d --build`
+
+## 贡献
+
+同时感谢以下开发者对 `Nonebot - R插件` 作出的贡献：
+
+<a href="https://github.com/zhiyu1998/Gemi2Api-Server/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=zhiyu1998/Gemi2Api-Server&max=1000" />
+</a>
