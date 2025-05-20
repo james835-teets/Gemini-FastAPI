@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timezone
 import os
 import base64
+import re
 import tempfile
 
 from fastapi import FastAPI, HTTPException, Request, Depends, Header
@@ -60,6 +61,35 @@ if not API_KEY:
 	logger.warning("Make sure API_KEY is correctly set in your .env file or environment.")
 else:
 	logger.info(f"API_KEY found. API_KEY starts with: {API_KEY[:5]}...")
+
+
+def correct_markdown(md_text: str) -> str:
+	"""
+	修正Markdown文本，移除Google搜索链接包装器，并根据显示文本简化目标URL。
+	"""
+	def simplify_link_target(text_content: str) -> str:
+		match_colon_num = re.match(r"([^:]+:\d+)", text_content)
+		if match_colon_num:
+			return match_colon_num.group(1)
+		return text_content
+
+	def replacer(match: re.Match) -> str:
+		outer_open_paren = match.group(1)
+		display_text = match.group(2)
+
+		new_target_url = simplify_link_target(display_text)
+		new_link_segment = f"[`{display_text}`]({new_target_url})"
+
+		if outer_open_paren:
+			return f"{outer_open_paren}{new_link_segment})"
+		else:
+			return new_link_segment
+	pattern = r"(\()?\[`([^`]+?)`\]\((https://www.google.com/search\?q=)(.*?)(?<!\\)\)\)*(\))?"
+	
+	fixed_google_links = re.sub(pattern, replacer, md_text)
+	# fix wrapped markdownlink
+	pattern = r"`(\[[^\]]+\]\([^\)]+\))`"
+	return re.sub(pattern, r'\1', fixed_google_links)
 
 
 # Pydantic models for API requests and responses
@@ -311,7 +341,9 @@ async def create_chat_completion(request: ChatCompletionRequest, api_key: str = 
 			reply_text = response.text
 		else:
 			reply_text = str(response)
-
+		reply_text = reply_text.replace("&lt;","<").replace("\\<","<").replace("\\_","_").replace("\\>",">")
+		reply_text = correct_markdown(reply_text)
+		
 		logger.info(f"Response: {reply_text}")
 
 		if not reply_text or reply_text.strip() == "":
