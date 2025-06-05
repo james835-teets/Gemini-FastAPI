@@ -337,10 +337,13 @@ async def create_chat_completion(request: ChatCompletionRequest, api_key: str = 
 
 		# 提取文本响应
 		reply_text = ""
+		# 提取思考内容
+		if hasattr(response, "thoughts"):
+		    reply_text += f"<think>{response.thoughts}</think>"
 		if hasattr(response, "text"):
-			reply_text = response.text
+			reply_text += response.text
 		else:
-			reply_text = str(response)
+			reply_text += str(response)
 		reply_text = reply_text.replace("&lt;","<").replace("\\<","<").replace("\\_","_").replace("\\>",">")
 		reply_text = correct_markdown(reply_text)
 		
