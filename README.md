@@ -1,6 +1,6 @@
 # Gemini-FastAPI
 
-[![Python 3.12](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.13](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green.svg)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -24,7 +24,7 @@ Web-based Gemini models wrapped into an OpenAI-compatible API. Powered by [Hanao
 
 ### Prerequisites
 
-- Python 3.12
+- Python 3.13
 - Google account with Gemini access on web
 - `secure_1psid` and `secure_1psidts` cookies from Gemini web interface
 
@@ -73,6 +73,30 @@ python run.py
 ```
 
 The server will start on `http://localhost:8000` by default.
+
+## API Endpoints
+
+The server provides several endpoints, including OpenAI-compatible ones.
+
+### OpenAI-Compatible Endpoints
+
+These endpoints are designed to be compatible with OpenAI's API structure, allowing you to use Gemini as a drop-in replacement.
+
+- **`GET /v1/models`**: Lists all supported Gemini models.
+- **`POST /v1/chat/completions`**: Unified chat interface.
+  - **Streaming**: Set `stream: true` to receive real-time delta chunks.
+  - **Multi-modal**: Supports text, images, and file uploads.
+  - **Tool Calling**: Supports function calling via the `tools` parameter.
+  - **Structured Output**: Supports `response_format` for JSON schema enforcement.
+
+### Advanced Endpoints
+
+- **`POST /v1/responses`**: An alternative endpoint for complex interaction patterns, supporting rich output items including generated images and tool calls.
+
+### Utility Endpoints
+
+- **`GET /health`**: Health check endpoint. Returns the status of the server, configured Gemini clients, and conversation storage.
+- **`GET /images/{filename}`**: Internal endpoint to serve generated images. Requires a valid token (automatically included in image URLs returned by the API).
 
 ## Docker Deployment
 

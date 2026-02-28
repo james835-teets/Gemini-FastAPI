@@ -2,7 +2,6 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import ORJSONResponse
 from loguru import logger
 
 from .server.chat import router as chat_router
@@ -43,7 +42,7 @@ async def _run_retention_cleanup(stop_event: asyncio.Event) -> None:
                 stop_event.wait(),
                 timeout=RETENTION_CLEANUP_INTERVAL_SECONDS,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             continue
 
     logger.info("LMDB retention cleanup task stopped.")
@@ -93,7 +92,6 @@ def create_app() -> FastAPI:
         description="OpenAI-compatible API for Gemini Web",
         version="1.0.0",
         lifespan=lifespan,
-        default_response_class=ORJSONResponse,
     )
 
     add_cors_middleware(app)

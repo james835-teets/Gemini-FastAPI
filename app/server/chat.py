@@ -3,10 +3,11 @@ import hashlib
 import io
 import reprlib
 import uuid
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any
 
 import orjson
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -17,7 +18,7 @@ from gemini_webapi.constants import Model
 from gemini_webapi.types.image import GeneratedImage, Image
 from loguru import logger
 
-from ..models import (
+from app.models import (
     ChatCompletionRequest,
     ContentItem,
     ConversationInStore,
@@ -32,17 +33,25 @@ from ..models import (
     ResponseInputItem,
     ResponseOutputContent,
     ResponseOutputMessage,
+    ResponseReasoning,
+    ResponseReasoningContentPart,
     ResponseToolCall,
     ResponseToolChoice,
     ResponseUsage,
     Tool,
     ToolChoiceFunction,
 )
-from ..services import GeminiClientPool, GeminiClientWrapper, LMDBConversationStore
-from ..utils import g_config
-from ..utils.helper import (
-    TOOL_HINT_LINE_END,
-    TOOL_HINT_LINE_START,
+from app.server.middleware import (
+    get_image_store_dir,
+    get_image_token,
+    get_temp_dir,
+    verify_api_key,
+)
+from app.services import GeminiClientPool, GeminiClientWrapper, LMDBConversationStore
+from app.utils import g_config
+from app.utils.helper import (
+    STREAM_MASTER_RE,
+    STREAM_TAIL_RE,
     TOOL_HINT_STRIPPED,
     TOOL_WRAP_HINT,
     detect_image_extension,
@@ -53,7 +62,6 @@ from ..utils.helper import (
     strip_system_hints,
     text_from_message,
 )
-from .middleware import get_image_store_dir, get_image_token, get_temp_dir, verify_api_key
 
 MAX_CHARS_PER_REQUEST = int(g_config.gemini.max_chars_per_request * 0.9)
 METADATA_TTL_MINUTES = 15
@@ -98,11 +106,7 @@ async def _image_to_base64(
 
     if not suffix:
         detected_ext = detect_image_extension(data)
-        if detected_ext:
-            suffix = detected_ext
-        else:
-            # Fallback if detection fails
-            suffix = ".png" if isinstance(image, GeneratedImage) else ".jpg"
+        suffix = detected_ext or (".png" if isinstance(image, GeneratedImage) else ".jpg")
 
     random_name = f"img_{uuid.uuid4().hex}{suffix}"
     new_path = temp_dir / random_name
@@ -118,8 +122,9 @@ def _calculate_usage(
     messages: list[Message],
     assistant_text: str | None,
     tool_calls: list[Any] | None,
-) -> tuple[int, int, int]:
-    """Calculate prompt, completion and total tokens consistently."""
+    thoughts: str | None = None,
+) -> tuple[int, int, int, int]:
+    """Calculate prompt, completion, total and reasoning tokens consistently."""
     prompt_tokens = sum(estimate_tokens(text_from_message(msg)) for msg in messages)
     tool_args_text = ""
     if tool_calls:
@@ -136,7 +141,15 @@ def _calculate_usage(
         )
 
     completion_tokens = estimate_tokens(completion_basis)
-    return prompt_tokens, completion_tokens, prompt_tokens + completion_tokens
+    reasoning_tokens = estimate_tokens(thoughts) if thoughts else 0
+    total_completion_tokens = completion_tokens + reasoning_tokens
+
+    return (
+        prompt_tokens,
+        total_completion_tokens,
+        prompt_tokens + total_completion_tokens,
+        reasoning_tokens,
+    )
 
 
 def _create_responses_standard_payload(
@@ -149,34 +162,50 @@ def _create_responses_standard_payload(
     usage: ResponseUsage,
     request: ResponseCreateRequest,
     normalized_input: Any,
+    full_thoughts: str | None = None,
 ) -> ResponseCreateResponse:
     """Unified factory for building ResponseCreateResponse objects."""
     message_id = f"msg_{uuid.uuid4().hex}"
-    tool_call_items: list[ResponseToolCall] = []
-    if detected_tool_calls:
-        tool_call_items = [
-            ResponseToolCall(
-                id=call.id if hasattr(call, "id") else call["id"],
+    reason_id = f"reason_{uuid.uuid4().hex}"
+
+    output_items: list[Any] = []
+    if full_thoughts:
+        output_items.append(
+            ResponseReasoning(
+                id=reason_id,
                 status="completed",
-                function=call.function if hasattr(call, "function") else call["function"],
+                content=[ResponseReasoningContentPart(text=full_thoughts)],
             )
-            for call in detected_tool_calls
-        ]
+        )
+
+    output_items.append(
+        ResponseOutputMessage(
+            id=message_id,
+            type="message",
+            role="assistant",
+            content=response_contents,
+        )
+    )
+
+    if detected_tool_calls:
+        output_items.extend(
+            [
+                ResponseToolCall(
+                    id=call.id if hasattr(call, "id") else call["id"],
+                    status="completed",
+                    function=call.function if hasattr(call, "function") else call["function"],
+                )
+                for call in detected_tool_calls
+            ]
+        )
+
+    output_items.extend(image_call_items)
 
     return ResponseCreateResponse(
         id=response_id,
         created_at=created_time,
         model=model_name,
-        output=[
-            ResponseOutputMessage(
-                id=message_id,
-                type="message",
-                role="assistant",
-                content=response_contents,
-            ),
-            *tool_call_items,
-            *image_call_items,
-        ],
+        output=output_items,
         status="completed",
         usage=usage,
         input=normalized_input or None,
@@ -194,6 +223,7 @@ def _create_chat_completion_standard_payload(
     tool_calls_payload: list[dict] | None,
     finish_reason: str,
     usage: dict,
+    reasoning_content: str | None = None,
 ) -> dict:
     """Unified factory for building Chat Completion response dictionaries."""
     return {
@@ -208,6 +238,7 @@ def _create_chat_completion_standard_payload(
                     "role": "assistant",
                     "content": visible_output or None,
                     "tool_calls": tool_calls_payload or None,
+                    "reasoning_content": reasoning_content or None,
                 },
                 "finish_reason": finish_reason,
             }
@@ -217,40 +248,41 @@ def _create_chat_completion_standard_payload(
 
 
 def _process_llm_output(
-    raw_output_with_think: str,
-    raw_output_clean: str,
+    thoughts: str | None,
+    raw_text: str,
     structured_requirement: StructuredOutputRequirement | None,
-) -> tuple[str, str, list[Any]]:
+) -> tuple[str | None, str, str, list[Any]]:
     """
     Post-process Gemini output to extract tool calls and prepare clean text for display and storage.
-    Returns: (visible_text, storage_output, tool_calls)
+    Returns: (thoughts, visible_text, storage_output, tool_calls)
     """
-    visible_with_think, tool_calls = extract_tool_calls(raw_output_with_think)
+    if thoughts:
+        thoughts = thoughts.strip()
+
+    visible_output, tool_calls = extract_tool_calls(raw_text)
     if tool_calls:
         logger.debug(f"Detected {len(tool_calls)} tool call(s) in model output.")
 
-    visible_output = visible_with_think.strip()
+    visible_output = visible_output.strip()
 
-    storage_output = remove_tool_call_blocks(raw_output_clean)
+    storage_output = remove_tool_call_blocks(raw_text)
     storage_output = storage_output.strip()
 
-    if structured_requirement:
-        cleaned_for_json = LMDBConversationStore.remove_think_tags(visible_output)
-        if cleaned_for_json:
-            try:
-                structured_payload = orjson.loads(cleaned_for_json)
-                canonical_output = orjson.dumps(structured_payload).decode("utf-8")
-                visible_output = canonical_output
-                storage_output = canonical_output
-                logger.debug(
-                    f"Structured response fulfilled (schema={structured_requirement.schema_name})."
-                )
-            except orjson.JSONDecodeError:
-                logger.warning(
-                    f"Failed to decode JSON for structured response (schema={structured_requirement.schema_name})."
-                )
+    if structured_requirement and visible_output:
+        try:
+            structured_payload = orjson.loads(visible_output)
+            canonical_output = orjson.dumps(structured_payload).decode("utf-8")
+            visible_output = canonical_output
+            storage_output = canonical_output
+            logger.debug(
+                f"Structured response fulfilled (schema={structured_requirement.schema_name})."
+            )
+        except orjson.JSONDecodeError:
+            logger.warning(
+                f"Failed to decode JSON for structured response (schema={structured_requirement.schema_name})."
+            )
 
-    return visible_output, storage_output, tool_calls
+    return thoughts, visible_output, storage_output, tool_calls
 
 
 def _persist_conversation(
@@ -261,6 +293,7 @@ def _persist_conversation(
     messages: list[Message],
     storage_output: str | None,
     tool_calls: list[Any] | None,
+    thoughts: str | None = None,
 ) -> str | None:
     """Unified logic to save conversation history to LMDB."""
     try:
@@ -268,6 +301,7 @@ def _persist_conversation(
             role="assistant",
             content=storage_output or None,
             tool_calls=tool_calls or None,
+            reasoning_content=thoughts or None,
         )
         full_history = [*messages, current_assistant_message]
         cleaned_history = db.sanitize_messages(full_history)
@@ -513,14 +547,22 @@ def _response_items_to_messages(
             messages.append(Message(role=role, content=content))
         else:
             converted: list[ContentItem] = []
+            reasoning_parts: list[str] = []
             for part in content:
-                if part.type == "input_text":
+                if part.type in ("input_text", "output_text"):
                     text_value = part.text or ""
                     normalized_contents.append(
-                        ResponseInputContent(type="input_text", text=text_value)
+                        ResponseInputContent(type=part.type, text=text_value)
                     )
                     if text_value:
                         converted.append(ContentItem(type="text", text=text_value))
+                elif part.type == "reasoning_text":
+                    text_value = part.text or ""
+                    normalized_contents.append(
+                        ResponseInputContent(type="reasoning_text", text=text_value)
+                    )
+                    if text_value:
+                        reasoning_parts.append(text_value)
                 elif part.type == "input_image":
                     image_url = part.image_url
                     if image_url:
@@ -581,11 +623,16 @@ def _instructions_to_messages(
             instruction_messages.append(Message(role=role, content=content))
         else:
             converted: list[ContentItem] = []
+            reasoning_parts: list[str] = []
             for part in content:
-                if part.type == "input_text":
+                if part.type in ("input_text", "output_text"):
                     text_value = part.text or ""
                     if text_value:
                         converted.append(ContentItem(type="text", text=text_value))
+                elif part.type == "reasoning_text":
+                    text_value = part.text or ""
+                    if text_value:
+                        reasoning_parts.append(text_value)
                 elif part.type == "input_image":
                     image_url = part.image_url
                     if image_url:
@@ -607,7 +654,13 @@ def _instructions_to_messages(
                         file_info["url"] = part.file_url
                     if file_info:
                         converted.append(ContentItem(type="file", file=file_info))
-            instruction_messages.append(Message(role=role, content=converted or None))
+            instruction_messages.append(
+                Message(
+                    role=role,
+                    content=converted or None,
+                    reasoning_content="\n".join(reasoning_parts) if reasoning_parts else None,
+                )
+            )
 
     return instruction_messages
 
@@ -628,7 +681,7 @@ def _get_model_by_name(name: str) -> Model:
 
 def _get_available_models() -> list[ModelData]:
     """Return a list of available models based on configuration strategy."""
-    now = int(datetime.now(tz=timezone.utc).timestamp())
+    now = int(datetime.now(tz=UTC).timestamp())
     strategy = g_config.gemini.model_strategy
     models_data = []
 
@@ -712,7 +765,7 @@ async def _send_with_split(
     text: str,
     files: list[Path | str | io.BytesIO] | None = None,
     stream: bool = False,
-) -> AsyncGenerator[ModelOutput, None] | ModelOutput:
+) -> AsyncGenerator[ModelOutput] | ModelOutput:
     """Send text to Gemini, splitting or converting to attachment if too long."""
     if len(text) <= MAX_CHARS_PER_REQUEST:
         try:
@@ -749,277 +802,86 @@ async def _send_with_split(
 class StreamingOutputFilter:
     """
     Filter to suppress technical protocol markers, tool calls, and system hints from the stream.
-    Uses a state machine to handle fragmentation where markers are split across multiple chunks.
+    Uses a stack-based state machine to handle nested fragmented markers.
     """
 
     def __init__(self):
         self.buffer = ""
-        self.state = "NORMAL"
+        self.stack = ["NORMAL"]
         self.current_role = ""
-        self.block_buffer = ""
 
-        self.STATE_MARKERS = {
-            "TOOL": {
-                "starts": ["[ToolCalls]", "\\[ToolCalls\\]"],
-                "ends": ["[/ToolCalls]", "\\[\\/ToolCalls\\]"],
-            },
-            "ORPHAN": {
-                "starts": ["[Call:", "\\[Call\\:"],
-                "ends": ["[/Call]", "\\[\\/Call\\]"],
-            },
-            "RESP": {
-                "starts": ["[ToolResults]", "\\[ToolResults\\]"],
-                "ends": ["[/ToolResults]", "\\[\\/ToolResults\\]"],
-            },
-            "ARG": {
-                "starts": ["[CallParameter:", "\\[CallParameter\\:"],
-                "ends": ["[/CallParameter]", "\\[\\/CallParameter\\]"],
-            },
-            "RESULT": {
-                "starts": ["[ToolResult]", "\\[ToolResult\\]"],
-                "ends": ["[/ToolResult]", "\\[\\/ToolResult\\]"],
-            },
-            "ITEM": {
-                "starts": ["[Result:", "\\[Result\\:"],
-                "ends": ["[/Result]", "\\[\\/Result\\]"],
-            },
-            "TAG": {
-                "starts": ["<|im_start|>", "\\<\\|im\\_start\\|\\>"],
-                "ends": ["<|im_end|>", "\\<\\|im\\_end\\|\\>"],
-            },
-        }
+    @property
+    def state(self):
+        return self.stack[-1]
 
-        hint_start = f"\n{TOOL_HINT_LINE_START}" if TOOL_HINT_LINE_START else ""
-        if hint_start:
-            self.STATE_MARKERS["HINT"] = {
-                "starts": [hint_start],
-                "ends": [TOOL_HINT_LINE_END],
-            }
-
-        self.ORPHAN_ENDS = [
-            "<|im_end|>",
-            "\\<\\|im\\_end\\|\\>",
-            "[/Call]",
-            "\\[\\/Call\\]",
-            "[/ToolCalls]",
-            "\\[\\/ToolCalls\\]",
-            "[/CallParameter]",
-            "\\[\\/CallParameter\\]",
-            "[/ToolResult]",
-            "\\[\\/ToolResult\\]",
-            "[/ToolResults]",
-            "\\[\\/ToolResults\\]",
-            "[/Result]",
-            "\\[\\/Result\\]",
-        ]
-
-        self.WATCH_MARKERS = []
-        for cfg in self.STATE_MARKERS.values():
-            self.WATCH_MARKERS.extend(cfg["starts"])
-            self.WATCH_MARKERS.extend(cfg.get("ends", []))
-        self.WATCH_MARKERS.extend(self.ORPHAN_ENDS)
+    def _is_outputting(self) -> bool:
+        """Determines if the current state allows yielding text to the stream."""
+        return self.state == "NORMAL" or (self.state == "IN_BLOCK" and self.current_role != "tool")
 
     def process(self, chunk: str) -> str:
         self.buffer += chunk
         output = []
 
         while self.buffer:
-            buf_low = self.buffer.lower()
-            if self.state == "NORMAL":
-                indices = []
-                for m_type, cfg in self.STATE_MARKERS.items():
-                    for p in cfg["starts"]:
-                        idx = buf_low.find(p.lower())
-                        if idx != -1:
-                            indices.append((idx, m_type, len(p)))
-
-                for p in self.ORPHAN_ENDS:
-                    idx = buf_low.find(p.lower())
-                    if idx != -1:
-                        indices.append((idx, "SKIP", len(p)))
-
-                if not indices:
-                    keep_len = 0
-                    for marker in self.WATCH_MARKERS:
-                        m_low = marker.lower()
-                        for i in range(len(m_low) - 1, 0, -1):
-                            if buf_low.endswith(m_low[:i]):
-                                keep_len = max(keep_len, i)
-                                break
-                    yield_len = len(self.buffer) - keep_len
-                    if yield_len > 0:
-                        output.append(self.buffer[:yield_len])
-                        self.buffer = self.buffer[yield_len:]
-                    break
-
-                indices.sort()
-                idx, m_type, m_len = indices[0]
-                output.append(self.buffer[:idx])
-                self.buffer = self.buffer[idx:]
-
-                if m_type == "SKIP":
-                    self.buffer = self.buffer[m_len:]
-                    continue
-
-                self.state = f"IN_{m_type}"
-                if m_type in ("TOOL", "ORPHAN"):
-                    self.block_buffer = ""
-
-                self.buffer = self.buffer[m_len:]
-
-            elif self.state == "IN_HINT":
-                cfg = self.STATE_MARKERS["HINT"]
-                found_idx, found_len = -1, 0
-                for p in cfg["ends"]:
-                    idx = buf_low.find(p.lower())
-                    if idx != -1 and (found_idx == -1 or idx < found_idx):
-                        found_idx, found_len = idx, len(p)
-
-                if found_idx != -1:
-                    self.buffer = self.buffer[found_idx + found_len :]
-                    self.state = "NORMAL"
-                else:
-                    max_end_len = max(len(p) for p in cfg["ends"])
-                    if len(self.buffer) > max_end_len:
-                        self.buffer = self.buffer[-max_end_len:]
-                    break
-
-            elif self.state == "IN_ARG":
-                cfg = self.STATE_MARKERS["ARG"]
-                found_idx, found_len = -1, 0
-                for p in cfg["ends"]:
-                    idx = buf_low.find(p.lower())
-                    if idx != -1 and (found_idx == -1 or idx < found_idx):
-                        found_idx, found_len = idx, len(p)
-
-                if found_idx != -1:
-                    self.buffer = self.buffer[found_idx + found_len :]
-                    self.state = "NORMAL"
-                else:
-                    max_end_len = max(len(p) for p in cfg["ends"])
-                    if len(self.buffer) > max_end_len:
-                        self.buffer = self.buffer[-max_end_len:]
-                    break
-
-            elif self.state == "IN_RESULT":
-                cfg = self.STATE_MARKERS["RESULT"]
-                found_idx, found_len = -1, 0
-                for p in cfg["ends"]:
-                    idx = buf_low.find(p.lower())
-                    if idx != -1 and (found_idx == -1 or idx < found_idx):
-                        found_idx, found_len = idx, len(p)
-
-                if found_idx != -1:
-                    self.buffer = self.buffer[found_idx + found_len :]
-                    self.state = "NORMAL"
-                else:
-                    max_end_len = max(len(p) for p in cfg["ends"])
-                    if len(self.buffer) > max_end_len:
-                        self.buffer = self.buffer[-max_end_len:]
-                    break
-
-            elif self.state == "IN_RESP":
-                cfg = self.STATE_MARKERS["RESP"]
-                found_idx, found_len = -1, 0
-                for p in cfg["ends"]:
-                    idx = buf_low.find(p.lower())
-                    if idx != -1 and (found_idx == -1 or idx < found_idx):
-                        found_idx, found_len = idx, len(p)
-
-                if found_idx != -1:
-                    self.buffer = self.buffer[found_idx + found_len :]
-                    self.state = "NORMAL"
-                else:
-                    break
-
-            elif self.state == "IN_TOOL":
-                cfg = self.STATE_MARKERS["TOOL"]
-                found_idx, found_len = -1, 0
-                for p in cfg["ends"]:
-                    idx = buf_low.find(p.lower())
-                    if idx != -1 and (found_idx == -1 or idx < found_idx):
-                        found_idx, found_len = idx, len(p)
-
-                if found_idx != -1:
-                    self.block_buffer += self.buffer[:found_idx]
-                    self.buffer = self.buffer[found_idx + found_len :]
-                    self.state = "NORMAL"
-                else:
-                    max_end_len = max(len(p) for p in cfg["ends"])
-                    if len(self.buffer) > max_end_len:
-                        self.block_buffer += self.buffer[:-max_end_len]
-                        self.buffer = self.buffer[-max_end_len:]
-                    break
-
-            elif self.state == "IN_ORPHAN":
-                cfg = self.STATE_MARKERS["ORPHAN"]
-                found_idx, found_len = -1, 0
-                for p in cfg["ends"]:
-                    idx = buf_low.find(p.lower())
-                    if idx != -1 and (found_idx == -1 or idx < found_idx):
-                        found_idx, found_len = idx, len(p)
-
-                if found_idx != -1:
-                    self.block_buffer += self.buffer[:found_idx]
-                    self.buffer = self.buffer[found_idx + found_len :]
-                    self.state = "NORMAL"
-                else:
-                    max_end_len = max(len(p) for p in cfg["ends"])
-                    if len(self.buffer) > max_end_len:
-                        self.block_buffer += self.buffer[:-max_end_len]
-                        self.buffer = self.buffer[-max_end_len:]
-                    break
-
-            elif self.state == "IN_TAG":
+            if self.state == "IN_TAG_HEADER":
                 nl_idx = self.buffer.find("\n")
                 if nl_idx != -1:
                     self.current_role = self.buffer[:nl_idx].strip().lower()
                     self.buffer = self.buffer[nl_idx + 1 :]
-                    self.state = "IN_BLOCK"
+                    self.stack[-1] = "IN_BLOCK"
+                    continue
                 else:
                     break
 
-            elif self.state == "IN_BLOCK":
-                cfg = self.STATE_MARKERS["TAG"]
-                found_idx, found_len = -1, 0
-                for p in cfg["ends"]:
-                    idx = buf_low.find(p.lower())
-                    if idx != -1 and (found_idx == -1 or idx < found_idx):
-                        found_idx, found_len = idx, len(p)
+            match = STREAM_MASTER_RE.search(self.buffer)
+            if not match:
+                tail_match = STREAM_TAIL_RE.search(self.buffer)
+                keep_len = len(tail_match.group(0)) if tail_match else 0
+                yield_len = len(self.buffer) - keep_len
+                if yield_len > 0:
+                    if self._is_outputting():
+                        output.append(self.buffer[:yield_len])
+                    self.buffer = self.buffer[yield_len:]
+                break
 
-                if found_idx != -1:
-                    content = self.buffer[:found_idx]
-                    if self.current_role != "tool":
-                        output.append(content)
-                    self.buffer = self.buffer[found_idx + found_len :]
-                    self.state = "NORMAL"
-                    self.current_role = ""
+            start, end = match.span()
+            matched_group = match.lastgroup
+            pre_text = self.buffer[:start]
+
+            if self._is_outputting():
+                output.append(pre_text)
+
+            if matched_group.endswith("_START"):
+                m_type = matched_group.split("_")[0]
+                if m_type == "TAG":
+                    self.stack.append("IN_TAG_HEADER")
                 else:
-                    max_end_len = max(len(p) for p in cfg["ends"])
-                    if self.current_role != "tool":
-                        if len(self.buffer) > max_end_len:
-                            output.append(self.buffer[:-max_end_len])
-                            self.buffer = self.buffer[-max_end_len:]
-                        break
-                    else:
-                        if len(self.buffer) > max_end_len:
-                            self.buffer = self.buffer[-max_end_len:]
-                        break
+                    self.stack.append(f"IN_{m_type}")
+            elif matched_group in ("PROTOCOL_EXIT", "TAG_EXIT", "HINT_EXIT"):
+                if len(self.stack) > 1:
+                    self.stack.pop()
+                else:
+                    self.stack = ["NORMAL"]
+
+                if self.state == "NORMAL":
+                    self.current_role = ""
+
+            self.buffer = self.buffer[end:]
 
         return "".join(output)
 
     def flush(self) -> str:
         """Release remaining buffer content and perform final cleanup at stream end."""
         res = ""
-        if self.state in ("IN_TOOL", "IN_ORPHAN", "IN_RESP", "IN_HINT", "IN_ARG", "IN_RESULT"):
-            res = ""
-        elif self.state == "IN_BLOCK" and self.current_role != "tool":
+        if self._is_outputting():
             res = self.buffer
-        elif self.state == "NORMAL":
-            res = self.buffer
+            tail_match = STREAM_TAIL_RE.search(res)
+            if tail_match:
+                res = res[: -len(tail_match.group(0))]
 
         self.buffer = ""
-        self.state = "NORMAL"
+        self.stack = ["NORMAL"]
+        self.current_role = ""
         return strip_system_hints(res)
 
 
@@ -1027,7 +889,7 @@ class StreamingOutputFilter:
 
 
 def _create_real_streaming_response(
-    generator: AsyncGenerator[ModelOutput, None],
+    generator: AsyncGenerator[ModelOutput],
     completion_id: str,
     created_time: int,
     model_name: str,
@@ -1047,7 +909,6 @@ def _create_real_streaming_response(
     async def generate_stream():
         full_thoughts, full_text = "", ""
         has_started = False
-        last_chunk_was_thought = False
         all_outputs: list[ModelOutput] = []
         suppressor = StreamingOutputFilter()
         try:
@@ -1067,8 +928,6 @@ def _create_real_streaming_response(
                     has_started = True
 
                 if t_delta := chunk.thoughts_delta:
-                    if not last_chunk_was_thought and not full_thoughts:
-                        yield f"data: {orjson.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'finish_reason': None}]}).decode('utf-8')}\n\n"
                     full_thoughts += t_delta
                     data = {
                         "id": completion_id,
@@ -1076,16 +935,16 @@ def _create_real_streaming_response(
                         "created": created_time,
                         "model": model_name,
                         "choices": [
-                            {"index": 0, "delta": {"content": t_delta}, "finish_reason": None}
+                            {
+                                "index": 0,
+                                "delta": {"reasoning_content": t_delta},
+                                "finish_reason": None,
+                            }
                         ],
                     }
                     yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
-                    last_chunk_was_thought = True
 
                 if text_delta := chunk.text_delta:
-                    if last_chunk_was_thought:
-                        yield f"data: {orjson.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': '</think>\n'}, 'finish_reason': None}]}).decode('utf-8')}\n\n"
-                        last_chunk_was_thought = False
                     full_text += text_delta
                     if visible_delta := suppressor.process(text_delta):
                         data = {
@@ -1114,9 +973,6 @@ def _create_real_streaming_response(
             if final_chunk.thoughts:
                 full_thoughts = final_chunk.thoughts
 
-        if last_chunk_was_thought:
-            yield f"data: {orjson.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': '</think>\n'}, 'finish_reason': None}]}).decode('utf-8')}\n\n"
-
         if remaining_text := suppressor.flush():
             data = {
                 "id": completion_id,
@@ -1129,10 +985,8 @@ def _create_real_streaming_response(
             }
             yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
 
-        raw_output_with_think = f"<think>{full_thoughts}</think>\n" if full_thoughts else ""
-        raw_output_with_think += full_text
-        assistant_text, storage_output, tool_calls = _process_llm_output(
-            raw_output_with_think, full_text, structured_requirement
+        _thoughts, assistant_text, storage_output, tool_calls = _process_llm_output(
+            full_thoughts, full_text, structured_requirement
         )
 
         images = []
@@ -1193,8 +1047,15 @@ def _create_real_streaming_response(
             }
             yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
 
-        p_tok, c_tok, t_tok = _calculate_usage(messages, assistant_text, tool_calls)
-        usage = {"prompt_tokens": p_tok, "completion_tokens": c_tok, "total_tokens": t_tok}
+        p_tok, c_tok, t_tok, r_tok = _calculate_usage(
+            messages, assistant_text, tool_calls, full_thoughts
+        )
+        usage = {
+            "prompt_tokens": p_tok,
+            "completion_tokens": c_tok,
+            "total_tokens": t_tok,
+            "completion_tokens_details": {"reasoning_tokens": r_tok},
+        }
         data = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -1210,9 +1071,10 @@ def _create_real_streaming_response(
             model.model_name,
             client_wrapper.id,
             session.metadata,
-            messages,  # This should be the prepared messages
+            messages,
             storage_output,
             tool_calls,
+            full_thoughts,
         )
         yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
         yield "data: [DONE]\n\n"
@@ -1221,7 +1083,7 @@ def _create_real_streaming_response(
 
 
 def _create_responses_real_streaming_response(
-    generator: AsyncGenerator[ModelOutput, None],
+    generator: AsyncGenerator[ModelOutput],
     response_id: str,
     created_time: int,
     model_name: str,
@@ -1248,11 +1110,15 @@ def _create_responses_real_streaming_response(
 
     async def generate_stream():
         yield f"data: {orjson.dumps({**base_event, 'type': 'response.created', 'response': {'id': response_id, 'object': 'response', 'created_at': created_time, 'model': model_name, 'status': 'in_progress', 'metadata': request.metadata, 'input': None, 'tools': request.tools, 'tool_choice': request.tool_choice}}).decode('utf-8')}\n\n"
-        message_id = f"msg_{uuid.uuid4().hex}"
-        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.added', 'output_index': 0, 'item': {'id': message_id, 'type': 'message', 'role': 'assistant', 'content': []}}).decode('utf-8')}\n\n"
 
         full_thoughts, full_text = "", ""
+        thought_item_id = f"reason_{uuid.uuid4().hex}"
+        message_item_id = f"msg_{uuid.uuid4().hex}"
+        thought_item_added = False
+        message_item_added = False
         last_chunk_was_thought = False
+        current_idx = 0
+
         all_outputs: list[ModelOutput] = []
         suppressor = StreamingOutputFilter()
 
@@ -1260,18 +1126,31 @@ def _create_responses_real_streaming_response(
             async for chunk in generator:
                 all_outputs.append(chunk)
                 if t_delta := chunk.thoughts_delta:
-                    if not last_chunk_was_thought and not full_thoughts:
-                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.delta', 'output_index': 0, 'delta': '<think>'}).decode('utf-8')}\n\n"
+                    if not thought_item_added:
+                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.added', 'output_index': current_idx, 'item': {'id': thought_item_id, 'type': 'reasoning', 'status': 'in_progress', 'content': []}}).decode('utf-8')}\n\n"
+                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.content_part.added', 'output_index': current_idx, 'part_index': 0, 'part': {'type': 'reasoning_text', 'text': ''}}).decode('utf-8')}\n\n"
+                        thought_item_added = True
+
                     full_thoughts += t_delta
-                    yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.delta', 'output_index': 0, 'delta': t_delta}).decode('utf-8')}\n\n"
+                    yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.delta', 'output_index': current_idx, 'part_index': 0, 'delta': t_delta}).decode('utf-8')}\n\n"
                     last_chunk_was_thought = True
+
                 if text_delta := chunk.text_delta:
                     if last_chunk_was_thought:
-                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.delta', 'output_index': 0, 'delta': '</think>\n'}).decode('utf-8')}\n\n"
+                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.done', 'output_index': current_idx, 'part_index': 0}).decode('utf-8')}\n\n"
+                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.content_part.done', 'output_index': current_idx, 'part_index': 0}).decode('utf-8')}\n\n"
+                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.done', 'output_index': current_idx, 'item': {'id': thought_item_id, 'type': 'reasoning', 'status': 'completed', 'content': [{'type': 'reasoning_text', 'text': full_thoughts}]}}).decode('utf-8')}\n\n"
+                        current_idx += 1
                         last_chunk_was_thought = False
+
+                    if not message_item_added:
+                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.added', 'output_index': current_idx, 'item': {'id': message_item_id, 'type': 'message', 'role': 'assistant', 'content': []}}).decode('utf-8')}\n\n"
+                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.content_part.added', 'output_index': current_idx, 'part_index': 0, 'part': {'type': 'output_text', 'text': ''}}).decode('utf-8')}\n\n"
+                        message_item_added = True
+
                     full_text += text_delta
                     if visible_delta := suppressor.process(text_delta):
-                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.delta', 'output_index': 0, 'delta': visible_delta}).decode('utf-8')}\n\n"
+                        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.delta', 'output_index': current_idx, 'part_index': 0, 'delta': visible_delta}).decode('utf-8')}\n\n"
         except Exception as e:
             logger.exception(f"Error during Responses API streaming: {e}")
             yield f"data: {orjson.dumps({**base_event, 'type': 'error', 'error': {'message': 'Streaming error.'}}).decode('utf-8')}\n\n"
@@ -1285,16 +1164,32 @@ def _create_responses_real_streaming_response(
                 full_thoughts = final_chunk.thoughts
 
         if last_chunk_was_thought:
-            yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.delta', 'output_index': 0, 'delta': '</think>\n'}).decode('utf-8')}\n\n"
-        if remaining_text := suppressor.flush():
-            yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.delta', 'output_index': 0, 'delta': remaining_text}).decode('utf-8')}\n\n"
-        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.done', 'output_index': 0}).decode('utf-8')}\n\n"
+            yield f"data: {orjson.dumps({**base_event, 'type': 'response.content_part.done', 'output_index': current_idx, 'part_index': 0}).decode('utf-8')}\n\n"
+            yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.done', 'output_index': current_idx, 'item': {'id': thought_item_id, 'type': 'reasoning', 'status': 'completed', 'content': [{'type': 'reasoning_text', 'text': full_thoughts}]}}).decode('utf-8')}\n\n"
+            current_idx += 1
 
-        raw_output_with_think = f"<think>{full_thoughts}</think>\n" if full_thoughts else ""
-        raw_output_with_think += full_text
-        assistant_text, storage_output, detected_tool_calls = _process_llm_output(
-            raw_output_with_think, full_text, structured_requirement
+        remaining_from_suppressor = suppressor.flush()
+        if remaining_from_suppressor:
+            if not message_item_added:
+                yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.added', 'output_index': current_idx, 'item': {'id': message_item_id, 'type': 'message', 'role': 'assistant', 'content': []}}).decode('utf-8')}\n\n"
+                yield f"data: {orjson.dumps({**base_event, 'type': 'response.content_part.added', 'output_index': current_idx, 'part_index': 0, 'part': {'type': 'output_text', 'text': ''}}).decode('utf-8')}\n\n"
+                message_item_added = True
+            yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.delta', 'output_index': current_idx, 'part_index': 0, 'delta': remaining_from_suppressor}).decode('utf-8')}\n\n"
+
+        # IMPORTANT: Process output now to get the final assistant_text
+        _thoughts, assistant_text, storage_output, detected_tool_calls = _process_llm_output(
+            full_thoughts, full_text, structured_requirement
         )
+
+        response_contents: list[ResponseOutputContent] = []
+        if message_item_added:
+            yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_text.done', 'output_index': current_idx, 'part_index': 0}).decode('utf-8')}\n\n"
+            yield f"data: {orjson.dumps({**base_event, 'type': 'response.content_part.done', 'output_index': current_idx, 'part_index': 0}).decode('utf-8')}\n\n"
+
+            msg_content = [{"type": "output_text", "text": assistant_text}]
+            yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.done', 'output_index': current_idx, 'item': {'id': message_item_id, 'type': 'message', 'role': 'assistant', 'content': msg_content}}).decode('utf-8')}\n\n"
+            response_contents.append(ResponseOutputContent(type="output_text", text=assistant_text))
+            current_idx += 1
 
         images = []
         seen_urls = set()
@@ -1305,7 +1200,7 @@ def _create_responses_real_streaming_response(
                         images.append(img)
                         seen_urls.add(img.url)
 
-        response_contents, image_call_items = [], []
+        image_call_items: list[ResponseImageGenerationCall] = []
         seen_hashes = set()
         for image in images:
             try:
@@ -1321,25 +1216,20 @@ def _create_responses_real_streaming_response(
                     img_id = fname
                     img_format = "png" if isinstance(image, GeneratedImage) else "jpeg"
 
-                image_url = f"![{fname}]({base_url}images/{fname}?token={get_image_token(fname)})"
-                image_call_items.append(
-                    ResponseImageGenerationCall(
-                        id=img_id,
-                        result=b64,
-                        output_format=img_format,
-                        size=f"{w}x{h}" if w and h else None,
-                    )
+                img_item = ResponseImageGenerationCall(
+                    id=img_id,
+                    result=b64,
+                    output_format=img_format,
+                    size=f"{w}x{h}" if w and h else None,
                 )
-                response_contents.append(ResponseOutputContent(type="output_text", text=image_url))
+                image_call_items.append(img_item)
+
+                yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.added', 'output_index': current_idx, 'item': img_item.model_dump(mode='json')}).decode('utf-8')}\n\n"
+                yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.done', 'output_index': current_idx, 'item': img_item.model_dump(mode='json')}).decode('utf-8')}\n\n"
+                current_idx += 1
             except Exception as exc:
                 logger.warning(f"Failed to process image in stream: {exc}")
 
-        if assistant_text:
-            response_contents.append(ResponseOutputContent(type="output_text", text=assistant_text))
-        if not response_contents:
-            response_contents.append(ResponseOutputContent(type="output_text", text=""))
-
-        # Aggregate images for storage
         image_markdown = ""
         for img_call in image_call_items:
             fname = f"{img_call.id}.{img_call.output_format}"
@@ -1349,21 +1239,28 @@ def _create_responses_real_streaming_response(
         if image_markdown:
             storage_output += image_markdown
 
-        yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.done', 'output_index': 0, 'item': {'id': message_id, 'type': 'message', 'role': 'assistant', 'content': [c.model_dump(mode='json') for c in response_contents]}}).decode('utf-8')}\n\n"
-
-        current_idx = 1
         for call in detected_tool_calls:
             tc_item = ResponseToolCall(id=call.id, status="completed", function=call.function)
             yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.added', 'output_index': current_idx, 'item': tc_item.model_dump(mode='json')}).decode('utf-8')}\n\n"
             yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.done', 'output_index': current_idx, 'item': tc_item.model_dump(mode='json')}).decode('utf-8')}\n\n"
             current_idx += 1
-        for img_call in image_call_items:
-            yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.added', 'output_index': current_idx, 'item': img_call.model_dump(mode='json')}).decode('utf-8')}\n\n"
-            yield f"data: {orjson.dumps({**base_event, 'type': 'response.output_item.done', 'output_index': current_idx, 'item': img_call.model_dump(mode='json')}).decode('utf-8')}\n\n"
-            current_idx += 1
 
-        p_tok, c_tok, t_tok = _calculate_usage(messages, assistant_text, detected_tool_calls)
-        usage = ResponseUsage(input_tokens=p_tok, output_tokens=c_tok, total_tokens=t_tok)
+        p_tok, c_tok, t_tok, r_tok = _calculate_usage(
+            messages, assistant_text, detected_tool_calls, full_thoughts
+        )
+        usage = ResponseUsage(
+            input_tokens=p_tok,
+            output_tokens=c_tok,
+            total_tokens=t_tok,
+            output_tokens_details={"reasoning_tokens": r_tok},
+        )
+
+        # Ensure we have at least one content item if none was created
+        if not response_contents:
+            response_contents.append(
+                ResponseOutputContent(type="output_text", text=assistant_text or "")
+            )
+
         payload = _create_responses_standard_payload(
             response_id,
             created_time,
@@ -1374,6 +1271,7 @@ def _create_responses_real_streaming_response(
             usage,
             request,
             None,
+            full_thoughts,
         )
         _persist_conversation(
             db,
@@ -1383,8 +1281,10 @@ def _create_responses_real_streaming_response(
             messages,
             storage_output,
             detected_tool_calls,
+            full_thoughts,
         )
         yield f"data: {orjson.dumps({**base_event, 'type': 'response.completed', 'response': payload.model_dump(mode='json')}).decode('utf-8')}\n\n"
+        yield f"data: {orjson.dumps({**base_event, 'type': 'response.done'})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
@@ -1455,10 +1355,12 @@ async def create_chat_completion(
             m_input, files = await GeminiClientWrapper.process_conversation(msgs, tmp_dir)
         except Exception as e:
             logger.exception("Error in preparing conversation")
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
+            ) from e
 
     completion_id = f"chatcmpl-{uuid.uuid4()}"
-    created_time = int(datetime.now(tz=timezone.utc).timestamp())
+    created_time = int(datetime.now(tz=UTC).timestamp())
 
     try:
         assert session and client
@@ -1470,7 +1372,7 @@ async def create_chat_completion(
         )
     except Exception as e:
         logger.exception("Gemini API error")
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
     if request.stream:
         return _create_real_streaming_response(
@@ -1488,7 +1390,7 @@ async def create_chat_completion(
         )
 
     try:
-        raw_with_t = GeminiClientWrapper.extract_output(resp_or_stream, include_thoughts=True)
+        thoughts = resp_or_stream.thoughts
         raw_clean = GeminiClientWrapper.extract_output(resp_or_stream, include_thoughts=False)
     except Exception as exc:
         logger.exception("Gemini output parsing failed.")
@@ -1496,8 +1398,8 @@ async def create_chat_completion(
             status_code=status.HTTP_502_BAD_GATEWAY, detail="Malformed response."
         ) from exc
 
-    visible_output, storage_output, tool_calls = _process_llm_output(
-        raw_with_t, raw_clean, structured_requirement
+    thoughts, visible_output, storage_output, tool_calls = _process_llm_output(
+        thoughts, raw_clean, structured_requirement
     )
 
     # Process images for OpenAI non-streaming flow
@@ -1525,8 +1427,15 @@ async def create_chat_completion(
     if tool_calls_payload:
         logger.debug(f"Detected tool calls: {reprlib.repr(tool_calls_payload)}")
 
-    p_tok, c_tok, t_tok = _calculate_usage(request.messages, visible_output, tool_calls)
-    usage = {"prompt_tokens": p_tok, "completion_tokens": c_tok, "total_tokens": t_tok}
+    p_tok, c_tok, t_tok, r_tok = _calculate_usage(
+        request.messages, visible_output, tool_calls, thoughts
+    )
+    usage = {
+        "prompt_tokens": p_tok,
+        "completion_tokens": c_tok,
+        "total_tokens": t_tok,
+        "completion_tokens_details": {"reasoning_tokens": r_tok},
+    }
     payload = _create_chat_completion_standard_payload(
         completion_id,
         created_time,
@@ -1535,6 +1444,7 @@ async def create_chat_completion(
         tool_calls_payload,
         "tool_calls" if tool_calls else "stop",
         usage,
+        thoughts,
     )
     _persist_conversation(
         db,
@@ -1544,6 +1454,7 @@ async def create_chat_completion(
         msgs,  # Use prepared messages 'msgs'
         storage_output,
         tool_calls,
+        thoughts,
     )
     return payload
 
@@ -1620,10 +1531,12 @@ async def create_response(
             m_input, files = await GeminiClientWrapper.process_conversation(messages, tmp_dir)
         except Exception as e:
             logger.exception("Error in preparing conversation")
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
+            ) from e
 
     response_id = f"resp_{uuid.uuid4().hex}"
-    created_time = int(datetime.now(tz=timezone.utc).timestamp())
+    created_time = int(datetime.now(tz=UTC).timestamp())
 
     try:
         assert session and client
@@ -1635,7 +1548,7 @@ async def create_response(
         )
     except Exception as e:
         logger.exception("Gemini API error")
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
 
     if request.stream:
         return _create_responses_real_streaming_response(
@@ -1655,15 +1568,17 @@ async def create_response(
         )
 
     try:
-        raw_t = GeminiClientWrapper.extract_output(resp_or_stream, include_thoughts=True)
-        raw_c = GeminiClientWrapper.extract_output(resp_or_stream, include_thoughts=False)
+        thoughts = resp_or_stream.thoughts
+        raw_clean = GeminiClientWrapper.extract_output(resp_or_stream, include_thoughts=False)
     except Exception as exc:
         logger.exception("Gemini parsing failed")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail="Malformed response."
         ) from exc
 
-    assistant_text, storage_output, tool_calls = _process_llm_output(raw_t, raw_c, struct_req)
+    thoughts, assistant_text, storage_output, tool_calls = _process_llm_output(
+        thoughts, raw_clean, struct_req
+    )
     images = resp_or_stream.images or []
     if (
         request.tool_choice is not None and request.tool_choice.type == "image_generation"
@@ -1718,8 +1633,13 @@ async def create_response(
     if image_markdown:
         storage_output += image_markdown
 
-    p_tok, c_tok, t_tok = _calculate_usage(messages, assistant_text, tool_calls)
-    usage = ResponseUsage(input_tokens=p_tok, output_tokens=c_tok, total_tokens=t_tok)
+    p_tok, c_tok, t_tok, r_tok = _calculate_usage(messages, assistant_text, tool_calls, thoughts)
+    usage = ResponseUsage(
+        input_tokens=p_tok,
+        output_tokens=c_tok,
+        total_tokens=t_tok,
+        output_tokens_details={"reasoning_tokens": r_tok},
+    )
     payload = _create_responses_standard_payload(
         response_id,
         created_time,
@@ -1730,8 +1650,16 @@ async def create_response(
         usage,
         request,
         norm_input,
+        thoughts,
     )
     _persist_conversation(
-        db, model.model_name, client.id, session.metadata, messages, storage_output, tool_calls
+        db,
+        model.model_name,
+        client.id,
+        session.metadata,
+        messages,
+        storage_output,
+        tool_calls,
+        thoughts,
     )
     return payload

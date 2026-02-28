@@ -5,9 +5,9 @@ import orjson
 from gemini_webapi import GeminiClient, ModelOutput
 from loguru import logger
 
-from ..models import Message
-from ..utils import g_config
-from ..utils.helper import (
+from app.models import Message
+from app.utils import g_config
+from app.utils.helper import (
     add_tag,
     normalize_llm_text,
     save_file_to_tempfile,
@@ -33,7 +33,7 @@ class GeminiClientWrapper(GeminiClient):
         timeout: float = cast(float, _UNSET),
         watchdog_timeout: float = cast(float, _UNSET),
         auto_close: bool = False,
-        close_delay: float = 300,
+        close_delay: float = cast(float, _UNSET),
         auto_refresh: bool = cast(bool, _UNSET),
         refresh_interval: float = cast(float, _UNSET),
         verbose: bool = cast(bool, _UNSET),
@@ -44,6 +44,7 @@ class GeminiClientWrapper(GeminiClient):
         config = g_config.gemini
         timeout = cast(float, _resolve(timeout, config.timeout))
         watchdog_timeout = cast(float, _resolve(watchdog_timeout, config.watchdog_timeout))
+        close_delay = timeout
         auto_refresh = cast(bool, _resolve(auto_refresh, config.auto_refresh))
         refresh_interval = cast(float, _resolve(refresh_interval, config.refresh_interval))
         verbose = cast(bool, _resolve(verbose, config.verbose))
@@ -146,9 +147,8 @@ class GeminiClientWrapper(GeminiClient):
 
         model_input = "\n".join(fragment for fragment in text_fragments if fragment is not None)
 
-        if model_input or message.role == "tool":
-            if tagged:
-                model_input = add_tag(message.role, model_input)
+        if (model_input or message.role == "tool") and tagged:
+            model_input = add_tag(message.role, model_input)
 
         return model_input, files
 
