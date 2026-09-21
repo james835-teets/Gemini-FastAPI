@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Gemini-FastAPI
 
 [![Python 3.13](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
@@ -267,3 +268,6 @@ export CONFIG_GEMINI__MODELS='[{"model_name": "gemini-3.0-pro", "model_header": 
 ## Disclaimer
 
 This project is not affiliated with Google or OpenAI and is intended solely for educational and research purposes. It uses reverse-engineered APIs and may not comply with Google's Terms of Service. Use at your own risk.
+=======
+# Gemini-FastAPI
+>>>>>>> origin/main
